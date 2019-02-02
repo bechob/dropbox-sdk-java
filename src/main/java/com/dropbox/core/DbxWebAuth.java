@@ -418,6 +418,39 @@ public class DbxWebAuth {
         );
     }
 
+
+    public DbxAuthFinish finishFromCodeWithPKCE(String code, final String state,
+                                                final String code_verifier)
+            throws DbxException {
+        if (code == null) throw new NullPointerException("code");
+
+        Map<String, String> params = new HashMap<String, String>();
+        params.put("grant_type", "authorization_code");
+        params.put("code", code);
+        params.put("locale", requestConfig.getUserLocale());
+        params.put("code_verifier", code_verifier);
+        params.put("client_id", appInfo.getKey());
+
+        return DbxRequestUtil.doPostNoAuth(
+                requestConfig,
+                DbxRawClientV2.USER_AGENT_ID,
+                appInfo.getHost().getApi(),
+                "oauth2/token",
+                DbxRequestUtil.toParamsArray(params),
+                null,
+                new DbxRequestUtil.ResponseHandler<DbxAuthFinish>() {
+                    @Override
+                    public DbxAuthFinish handle(HttpRequestor.Response response) throws DbxException {
+                        if (response.getStatusCode() != 200) {
+                            throw DbxRequestUtil.unexpectedStatus(response);
+                        }
+                        return DbxRequestUtil.readJsonFromResponse(DbxAuthFinish.Reader, response)
+                                .withUrlState(state);
+                    }
+                }
+        );
+    }
+
     /**
      * Call this after the user has visited the authorizaton URL and Dropbox has redirected them
      * back to you (using the {@code redirectUri} you passed in to {@link #start}.

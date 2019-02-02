@@ -1,8 +1,15 @@
 package com.dropbox.core.android;
 
+import java.security.MessageDigest;
 import java.security.SecureRandom;
+
+import android.os.AsyncTask;
+import android.os.SystemClock;
+import android.util.Base64;
 import java.util.List;
 import java.util.Locale;
+import java.util.Random;
+import java.util.concurrent.ExecutionException;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -19,7 +26,12 @@ import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
 
+import com.dropbox.core.DbxAppInfo;
+import com.dropbox.core.DbxAuthFinish;
+import com.dropbox.core.DbxException;
+import com.dropbox.core.DbxRequestConfig;
 import com.dropbox.core.DbxRequestUtil;
+import com.dropbox.core.DbxWebAuth;
 
 //Note: This class's code is duplicated between Core SDK and Sync SDK.  For now,
 //it has to be manually copied, but the code is set up so that it can be used in both
@@ -82,6 +94,26 @@ public class AuthActivity extends Activity {
     public static final String EXTRA_AUTH_STATE = "AUTH_STATE";
 
     /**
+     * Used for internal authentication. You won't ever have to use this.
+     */
+    public static final String EXTRA_AUTH_CODE_CHALLENGE = "CODE_CHALLENGE";
+
+    /**
+     * Used for internal authentication. You won't ever have to use this.
+     */
+    public static final String EXTRA_AUTH_CODE_CHALLENGE_METHOD = "CODE_CHALLENGE_METHOD";
+
+    /**
+     * Used for internal authentication. You won't ever have to use this.
+     */
+    public static final String EXTRA_AUTH_TOKEN_ACCESS_TYPE = "TOKEN_ACCESS_TYPE";
+
+    /**
+     * Used for internal authentication. You won't ever have to use this.
+     */
+    private static final String EXTRA_AUTH_TOKEN_SCOPE = "SCOPE";
+
+    /**
      * Used for internal authentication. Allows app to request a specific UID to auth against
      * You won't ever have to use this.
      */
@@ -123,8 +155,29 @@ public class AuthActivity extends Activity {
 
     private static final String DEFAULT_WEB_HOST = "www.dropbox.com";
 
-    // saved instance state keys
-    private static final String SIS_KEY_AUTH_STATE_NONCE = "SIS_KEY_AUTH_STATE_NONCE";
+    /**
+     * saved instance state keys
+     */
+    private static final String SIS_KEY_AUTH_STATE_PARAMS = "SIS_KEY_AUTH_STATE_PARAMS";
+
+    /**
+     * The minimum length of random bytes for create code verifier in
+     * {@link #createCodeVerifier()} (SecureRandom,int)}.
+     */
+    private static final int MIN_CODE_VERIFIER_RANDOM_BYTES = 32;
+
+    /**
+     * The maximum length of random bytes for create code verifier in
+     * {@link #createCodeVerifier()} (SecureRandom,int)}.
+     */
+    private static final int MAX_CODE_VERIFIER_RANDOM_BYTES = 96;
+
+
+    /**
+     * Base64 encoding settings used for generated code verifiers.
+     */
+    private static final int PKCE_BASE64_ENCODE_SETTINGS =
+            Base64.NO_WRAP | Base64.NO_PADDING | Base64.URL_SAFE;
 
     /**
      * Provider of the local security needs of an AuthActivity.
@@ -161,6 +214,8 @@ public class AuthActivity extends Activity {
     private static String sDesiredUid;
     private static String[] sAlreadyAuthedUids;
     private static String sSessionId;
+    private static String sTokenAccessType;
+    private static String sScope;
 
     // These instance variables need not be stored in savedInstanceState as onNewIntent()
     // does not read them.
@@ -170,10 +225,64 @@ public class AuthActivity extends Activity {
     private String mDesiredUid;
     private String[] mAlreadyAuthedUids;
     private String mSessionId;
+    private String mTokenAccessType;
+    private String mScope;
+
+    private class AuthUrlQueryParams {
+        private final String state;
+        private final String codeVerifier;
+        private String codeChallenge;
+        private String codeChallengeMethod;
+        private String tokenAccessType;
+        private String scope;
+
+        private AuthUrlQueryParams(String state,
+                /*Nullable*/ String codeVerifier,
+                /*Nullable*/ String codeChallenge,
+                /*Nullable*/ String codeChallengeMethod,
+                /*Nullable*/ String tokenAccessTypes,
+                /*Nullable*/ String scope) {
+            this.state = state;
+            this.codeVerifier = codeVerifier;
+            this.codeChallenge = codeChallenge;
+            this.codeChallengeMethod = codeChallengeMethod;
+            this.tokenAccessType = tokenAccessTypes;
+            this.scope = scope;
+        }
+
+        private void loadUrlQueryParams(Intent intent) {
+            intent.putExtra(EXTRA_AUTH_STATE, this.state);
+            if (codeChallenge != null) {
+                intent.putExtra(EXTRA_AUTH_CODE_CHALLENGE, this.codeChallenge);
+            }
+            if (codeChallengeMethod != null) {
+                intent.putExtra(EXTRA_AUTH_CODE_CHALLENGE_METHOD, this.codeChallengeMethod);
+            }
+            if (tokenAccessType != null) {
+                intent.putExtra(EXTRA_AUTH_TOKEN_ACCESS_TYPE, this.tokenAccessType);
+            }
+            if (scope != null) {
+                intent.putExtra(EXTRA_AUTH_TOKEN_SCOPE, this.scope);
+            }
+        }
+
+        private AuthUrlQueryParams(Bundle bundle) {
+            String[] stringArray = bundle.getStringArray(SIS_KEY_AUTH_STATE_PARAMS);
+            this.state = stringArray[0];
+            this.codeVerifier = stringArray[1];
+        }
+
+        private void storeStatus(Bundle bundle) {
+            bundle.putStringArray(SIS_KEY_AUTH_STATE_PARAMS,
+                    new String[]{this.state, this.codeVerifier});
+        }
+
+    }
 
     // Stored in savedInstanceState to track an ongoing auth attempt, which
     // must include a locally-generated nonce in the response.
-    private String mAuthStateNonce = null;
+    private AuthUrlQueryParams mAuthUrlQueryParams = null;
+
 
     private boolean mActivityDispatchHandlerPosted = false;
 
@@ -192,7 +301,7 @@ public class AuthActivity extends Activity {
      */
     static void setAuthParams(String appKey, String desiredUid,
                               String[] alreadyAuthedUids, String webHost, String apiType) {
-        setAuthParams(appKey, desiredUid, alreadyAuthedUids, null, null, null);
+        setAuthParams(appKey, desiredUid, alreadyAuthedUids, null, null, null, null, null);
     }
 
     /**
@@ -200,20 +309,25 @@ public class AuthActivity extends Activity {
      */
     static void setAuthParams(String appKey, String desiredUid,
                               String[] alreadyAuthedUids, String sessionId) {
-        setAuthParams(appKey, desiredUid, alreadyAuthedUids, sessionId, null, null);
+        setAuthParams(appKey, desiredUid, alreadyAuthedUids, sessionId,
+                null, null, null, null);
     }
 
     /**
      * Set static authentication parameters
      */
     static void setAuthParams(String appKey, String desiredUid,
-                              String[] alreadyAuthedUids, String sessionId, String webHost, String apiType) {
+                              String[] alreadyAuthedUids, String sessionId,
+                              String webHost, String apiType,
+                              String tokenAccessType, String scope) {
         sAppKey = appKey;
         sDesiredUid = desiredUid;
         sAlreadyAuthedUids = (alreadyAuthedUids != null) ? alreadyAuthedUids : new String[0];
         sSessionId = sessionId;
         sWebHost = (webHost != null) ? webHost : DEFAULT_WEB_HOST;
         sApiType = apiType;
+        sTokenAccessType = tokenAccessType;
+        sScope = scope;
     }
 
     /**
@@ -228,7 +342,7 @@ public class AuthActivity extends Activity {
      * @return a newly created intent.
      */
     public static Intent makeIntent(Context context, String appKey, String webHost,
-                                          String apiType) {
+                                    String apiType) {
         return makeIntent(context, appKey, null, null, null, webHost, apiType);
     }
 
@@ -255,7 +369,9 @@ public class AuthActivity extends Activity {
     public static Intent makeIntent(Context context, String appKey, String desiredUid, String[] alreadyAuthedUids,
                                     String sessionId, String webHost, String apiType) {
         if (appKey == null) throw new IllegalArgumentException("'appKey' can't be null");
-        setAuthParams(appKey, desiredUid, alreadyAuthedUids, sessionId, webHost, apiType);
+        // Hard coded token access type with online access and dummy scope parameter
+        setAuthParams(appKey, desiredUid, alreadyAuthedUids,
+                sessionId, webHost, apiType, "online", "test_scope");
         return new Intent(context, AuthActivity.class);
     }
 
@@ -370,12 +486,14 @@ public class AuthActivity extends Activity {
         mDesiredUid = sDesiredUid;
         mAlreadyAuthedUids = sAlreadyAuthedUids;
         mSessionId = sSessionId;
+        mTokenAccessType = sTokenAccessType;
+        mScope = sScope;
 
         if (savedInstanceState == null) {
             result = null;
-            mAuthStateNonce = null;
+            mAuthUrlQueryParams = null;
         } else {
-            mAuthStateNonce = savedInstanceState.getString(SIS_KEY_AUTH_STATE_NONCE);
+            mAuthUrlQueryParams = new AuthUrlQueryParams(savedInstanceState);
         }
 
         setTheme(android.R.style.Theme_Translucent_NoTitleBar);
@@ -386,7 +504,7 @@ public class AuthActivity extends Activity {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
-        outState.putString(SIS_KEY_AUTH_STATE_NONCE, mAuthStateNonce);
+        mAuthUrlQueryParams.storeStatus(outState);
     }
 
     /**
@@ -408,12 +526,13 @@ public class AuthActivity extends Activity {
             return;
         }
 
-        if (mAuthStateNonce != null || mAppKey == null) {
+        if (mAuthUrlQueryParams != null || mAppKey == null) {
             // We somehow returned to this activity without being forwarded
             // here by the official app.
             // Most commonly caused by user hitting "back" from the auth screen
             // or (if doing browser auth) task switching from auth task back to
             // this one.
+            Log.v(TAG,"on resume fails");
             authFinished(null);
             return;
         }
@@ -425,10 +544,7 @@ public class AuthActivity extends Activity {
             return;
         }
 
-        // Random entropy passed through auth makes sure we don't accept a
-        // response which didn't come from our request.  Each random
-        // value is only ever used once.
-        final String state = createStateNonce();
+        final AuthUrlQueryParams stateParams = createAuthUrlQueryParams();
 
         // Create intent to auth with official app.
         final Intent officialAuthIntent = getOfficialAuthIntent();
@@ -439,7 +555,7 @@ public class AuthActivity extends Activity {
         officialAuthIntent.putExtra(EXTRA_SESSION_ID, mSessionId);
         officialAuthIntent.putExtra(EXTRA_CALLING_PACKAGE, getPackageName());
         officialAuthIntent.putExtra(EXTRA_CALLING_CLASS, getClass().getName());
-        officialAuthIntent.putExtra(EXTRA_AUTH_STATE, state);
+        stateParams.loadUrlQueryParams(officialAuthIntent);
 
         /*
          * An Android bug exists where onResume may be called twice in rapid succession.
@@ -452,12 +568,16 @@ public class AuthActivity extends Activity {
             public void run() {
 
                 Log.d(TAG, "running startActivity in handler");
+                mAuthUrlQueryParams = null;
+                // Random entropy passed through auth makes sure we don't accept a
+                // response which didn't come from our request.  Each random
+                // value is only ever used once.
                 try {
                     // Auth with official app, or fall back to web.
                     if (DbxOfficialAppConnector.getDropboxAppPackage(AuthActivity.this, officialAuthIntent) != null) {
                         startActivity(officialAuthIntent);
                     } else {
-                        startWebAuth(state);
+                        startWebAuth(stateParams.state);
                     }
                 } catch (ActivityNotFoundException e) {
                     Log.e(TAG, "Could not launch intent. User may have restricted profile", e);
@@ -466,7 +586,7 @@ public class AuthActivity extends Activity {
                 }
                 // Save state that indicates we started a request, only after
                 // we started one successfully.
-                mAuthStateNonce = state;
+                mAuthUrlQueryParams = stateParams;
                 setAuthParams(null, null, null);
             }
         });
@@ -478,7 +598,7 @@ public class AuthActivity extends Activity {
     @Override
     protected void onNewIntent(Intent intent) {
         // Reject attempt to finish authentication if we never started (nonce=null)
-        if (null == mAuthStateNonce) {
+        if (null == mAuthUrlQueryParams) {
             authFinished(null);
             return;
         }
@@ -514,27 +634,71 @@ public class AuthActivity extends Activity {
                 state != null && !state.equals("")) {
             // Reject attempt to link if the nonce in the auth state doesn't match,
             // or if we never asked for auth at all.
-            if (!mAuthStateNonce.equals(state)) {
+            if (!mAuthUrlQueryParams.state.equals(state)) {
                 authFinished(null);
                 return;
             }
 
             // Successful auth.
             newResult = new Intent();
-            newResult.putExtra(EXTRA_ACCESS_TOKEN, token);
-            newResult.putExtra(EXTRA_ACCESS_SECRET, secret);
-            newResult.putExtra(EXTRA_UID, uid);
+            Log.v(TAG, "token: "+ token+" secret: "+ secret + " uid: "+uid+" state "+ state);
+            CodeAsyncTask codeAsyncTask = new CodeAsyncTask(
+                    secret, state, mAuthUrlQueryParams.codeVerifier, newResult);
+            try {
+                codeAsyncTask.execute().get();
+            } catch (Exception e) {
+                newResult = null;
+            }
         } else {
             // Unsuccessful auth, or missing required parameters.
             newResult = null;
+
+        }
+        authFinished(newResult);
+    }
+
+
+    private class CodeAsyncTask
+        extends AsyncTask<Void, Void, DbxAuthFinish> {
+
+        private final String code;
+        private final String state;
+        private final String codeVerifier;
+        private final Intent newResult;
+        private final DbxWebAuth webAuth;
+
+        private CodeAsyncTask(String code, String state,
+                                    String codeVerifier, Intent newResult) {
+            this.code = code;
+            this.state = state;
+            this.codeVerifier = codeVerifier;
+            this.newResult = newResult;
+            DbxMobileAppInfo appInfo = new DbxMobileAppInfo(mAppKey);
+            DbxRequestConfig requestConfig = new DbxRequestConfig("android-code");
+            webAuth = new DbxWebAuth(requestConfig, appInfo);
         }
 
-        authFinished(newResult);
+        @Override
+        protected DbxAuthFinish doInBackground(Void... params) {
+            DbxAuthFinish authFinish;
+            try {
+                authFinish = this.webAuth.finishFromCodeWithPKCE(
+                        this.code, this.state, this.codeVerifier);
+                newResult.putExtra(EXTRA_ACCESS_TOKEN, "oauth2code");
+                newResult.putExtra(EXTRA_ACCESS_SECRET, authFinish.getAccessToken());
+                newResult.putExtra(EXTRA_UID, authFinish.getUserId());
+                Log.v(TAG, "Redeem token success " + authFinish.getAccessToken());
+            } catch (DbxException e) {
+                Log.v(TAG, "Redeem token failures with " + e.getMessage());
+                authFinish = null;
+            }
+            return authFinish;
+        }
     }
 
     private void authFinished(Intent authResult) {
         result = authResult;
-        mAuthStateNonce = null;
+        mAuthUrlQueryParams = null;
         setAuthParams(null, null, null);
         finish();
     }
@@ -561,7 +725,16 @@ public class AuthActivity extends Activity {
         startActivity(intent);
     }
 
-    private String createStateNonce() {
+    private String createCodeVerifier() {
+        final int RANDOM_BYTES = new Random().nextInt(MAX_CODE_VERIFIER_RANDOM_BYTES-
+                MIN_CODE_VERIFIER_RANDOM_BYTES + 1) + MIN_CODE_VERIFIER_RANDOM_BYTES;
+        Log.w(TAG, "code verifier length " + RANDOM_BYTES);
+        byte randomBytes[] = new byte[RANDOM_BYTES];
+        getSecureRandom().nextBytes(randomBytes);
+        return Base64.encodeToString(randomBytes, PKCE_BASE64_ENCODE_SETTINGS);
+    }
+
+    private AuthUrlQueryParams createStateNonce() {
         final int NONCE_BYTES = 16; // 128 bits of randomness.
         byte randomBytes[] = new byte[NONCE_BYTES];
         getSecureRandom().nextBytes(randomBytes);
@@ -570,6 +743,48 @@ public class AuthActivity extends Activity {
         for (int i = 0; i < NONCE_BYTES; ++i) {
             sb.append(String.format("%02x", (randomBytes[i]&0xff)));
         }
+        return new AuthUrlQueryParams(sb.toString(), null, null, null, null, null);
+    }
+
+    private String createStateForPKCE(String codeChallenge,
+                                      String codeChallengeMethod,
+                                      String tokenAccessType) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("oauth2code:");
+        sb.append(codeChallenge);
+        sb.append(':');
+        sb.append(codeChallengeMethod);
+        sb.append(':');
+        sb.append(tokenAccessType);
+        Log.w(TAG, "status created " + sb.toString());
         return sb.toString();
+    }
+
+    private AuthUrlQueryParams createAuthUrlQueryParams() {
+        String codeVerifier = createCodeVerifier();
+        Log.w(TAG, "code verifier created " + codeVerifier);
+        String codeChallenge;
+        String codeChallengeMethod;
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(codeVerifier.getBytes("UTF-8"));
+            codeChallenge = Base64.encodeToString(hash, PKCE_BASE64_ENCODE_SETTINGS);
+            codeChallengeMethod = "S256"; // S256
+            Log.w(TAG, "code challenge created with method S256 " + codeChallenge);
+
+        } catch (Exception e) {
+            codeChallenge = codeVerifier;
+            codeChallengeMethod = "plain";  // plain
+            Log.w(TAG, "code challenge created with method plain " + codeChallenge);
+        }
+
+        String state = createStateForPKCE(codeChallenge, codeChallengeMethod, mTokenAccessType);
+        return new AuthUrlQueryParams(
+                state,
+                codeVerifier,
+                codeChallenge,
+                codeChallengeMethod,
+                mTokenAccessType,
+                mScope);
     }
 }

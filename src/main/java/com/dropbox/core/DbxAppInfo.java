@@ -233,7 +233,7 @@ public class DbxAppInfo extends Dumpable {
         throw new IllegalArgumentException("Bad 'key': " + error);
     }
 
-    public static void checkSecretArg(String secret)
+    public void checkSecretArg(String secret)
     {
         String error = getTokenPartError(secret);
         if (error == null) return;
