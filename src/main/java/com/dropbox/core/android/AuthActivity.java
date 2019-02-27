@@ -99,6 +99,11 @@ public class AuthActivity extends Activity {
     public static final String EXTRA_AUTH_QUERY_PARAMS = "AUTH_QUERY_PARAMS";
 
     /**
+     * Used for internal authentication. You won't ever have to use this.
+     */
+    public static final String EXTRA_AUTH_QUERY_RESULTS = "AUTH_QUERY_RESULTS";
+
+    /**
      * Used for internal authentication. Allows app to request a specific UID to auth against
      * You won't ever have to use this.
      */
@@ -591,6 +596,7 @@ public class AuthActivity extends Activity {
             secret = intent.getStringExtra(EXTRA_ACCESS_SECRET);
             uid = intent.getStringExtra(EXTRA_UID);
             state = intent.getStringExtra(EXTRA_AUTH_STATE);
+            String extraAuthQueryResults = intent.getStringExtra(EXTRA_AUTH_QUERY_RESULTS);
         } else {
             // Web auth.
             Uri uri = intent.getData();
