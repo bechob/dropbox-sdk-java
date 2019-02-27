@@ -96,22 +96,12 @@ public class AuthActivity extends Activity {
     /**
      * Used for internal authentication. You won't ever have to use this.
      */
-    public static final String EXTRA_AUTH_CODE_CHALLENGE = "CODE_CHALLENGE";
+    public static final String EXTRA_AUTH_QUERY_PARAMS = "AUTH_QUERY_PARAMS";
 
     /**
      * Used for internal authentication. You won't ever have to use this.
      */
-    public static final String EXTRA_AUTH_CODE_CHALLENGE_METHOD = "CODE_CHALLENGE_METHOD";
-
-    /**
-     * Used for internal authentication. You won't ever have to use this.
-     */
-    public static final String EXTRA_AUTH_TOKEN_ACCESS_TYPE = "TOKEN_ACCESS_TYPE";
-
-    /**
-     * Used for internal authentication. You won't ever have to use this.
-     */
-    private static final String EXTRA_AUTH_TOKEN_SCOPE = "SCOPE";
+    public static final String EXTRA_AUTH_QUERY_RESULTS = "AUTH_QUERY_RESULTS";
 
     /**
      * Used for internal authentication. Allows app to request a specific UID to auth against
@@ -252,18 +242,13 @@ public class AuthActivity extends Activity {
 
         private void loadUrlQueryParams(Intent intent) {
             intent.putExtra(EXTRA_AUTH_STATE, this.state);
-            if (codeChallenge != null) {
-                intent.putExtra(EXTRA_AUTH_CODE_CHALLENGE, this.codeChallenge);
-            }
-            if (codeChallengeMethod != null) {
-                intent.putExtra(EXTRA_AUTH_CODE_CHALLENGE_METHOD, this.codeChallengeMethod);
-            }
-            if (tokenAccessType != null) {
-                intent.putExtra(EXTRA_AUTH_TOKEN_ACCESS_TYPE, this.tokenAccessType);
-            }
-            if (scope != null) {
-                intent.putExtra(EXTRA_AUTH_TOKEN_SCOPE, this.scope);
-            }
+            String extraAuthQueryParams = String.format(
+                    "response_type=code&token_access_type=%s&code_challenge=%s&code_challenge_method=%s&scope=%s",
+                    this.tokenAccessType,
+                    this.codeChallenge,
+                    this.codeChallengeMethod,
+                    this.scope);
+            intent.putExtra(EXTRA_AUTH_QUERY_PARAMS, extraAuthQueryParams);
         }
 
         private AuthUrlQueryParams(Bundle bundle) {
@@ -611,6 +596,7 @@ public class AuthActivity extends Activity {
             secret = intent.getStringExtra(EXTRA_ACCESS_SECRET);
             uid = intent.getStringExtra(EXTRA_UID);
             state = intent.getStringExtra(EXTRA_AUTH_STATE);
+            String extraAuthQueryResults = intent.getStringExtra(EXTRA_AUTH_QUERY_RESULTS);
         } else {
             // Web auth.
             Uri uri = intent.getData();
